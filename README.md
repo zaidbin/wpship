@@ -133,6 +133,18 @@ KEEP_BACKUPS=5
 
 Backups are stored on the server in `~/wpship-backups/<site>/`, outside the web root.
 
+## Data handling
+
+wpship has no servers or accounts of its own and sends nothing to the plugin author or any third party. All data moves only between **your computer** and **the server you configure**, over your own SSH connection.
+
+| What | Where it goes | Kept where / how long |
+|---|---|---|
+| Theme, plugin and (with `--uploads`) media files | Your computer ↔ your server | Your server and your computer |
+| WordPress database (with `--db`): posts, settings, and site users' and commenters' names and emails | Your computer ↔ your server | Live backups on your server in `~/wpship-backups/<site>/` (newest 5 kept, `KEEP_BACKUPS`); local copies in `.wpship/local-backups/` when you pull (delete them anytime) |
+| Server address, SSH user, paths, URLs | Nowhere — stays on your computer | `.wpship/config` (chmod 600, git-ignored); no passwords or keys are stored |
+
+wpship never reads, copies or sends SSH keys or passwords; logging in is handled by your system's `ssh`. After a push it requests your live site's homepage once to check it loads.
+
 ## Not supported yet
 
 - Shared hosting without SSH (FTP/cPanel-only)
