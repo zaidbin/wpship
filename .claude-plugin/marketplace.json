@@ -1,6 +1,9 @@
 {
   "name": "wpship",
-  "owner": { "name": "A. Zaid Niazi" },
+  "owner": {
+    "name": "A. Zaid Niazi"
+  },
+  "description": "wpship: deploy a local WordPress site to any VPS or host over SSH, with backups and rollback.",
   "plugins": [
     {
       "name": "wpship",
