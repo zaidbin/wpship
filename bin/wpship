@@ -7,7 +7,7 @@
 
 set -Eeuo pipefail
 
-VERSION="0.1.0"
+VERSION="0.2.0"
 CONFIG_DIR_NAME=".wpship"
 
 # ---------------------------------------------------------------- output ----
@@ -52,7 +52,7 @@ ${B}Usage:${N} wpship <command> [options]
 
 ${B}Setup${N}
   init             Save server details for this site (.wpship/config)
-  check            Test SSH, rsync, WP-CLI and the remote WordPress install
+  check            Test SSH, WP-CLI and the remote WordPress install
   install-wpcli    Install WP-CLI on the server (if it's missing)
 
 ${B}Everyday${N}
@@ -100,6 +100,7 @@ load_config() {
   REMOTE_PATH=""; REMOTE_URL=""; LOCAL_URL=""
   LOCAL_WP="wp"; REMOTE_WP="wp"; REMOTE_OWNER=""
   SYNC_DIRS="themes plugins mu-plugins"; KEEP_BACKUPS="5"
+  TRANSFER="auto"   # auto | rsync | tar
   # shellcheck source=/dev/null
   source "$CONFIG_FILE"
 
@@ -109,9 +110,13 @@ load_config() {
   REMOTE_PATH="${REMOTE_PATH%/}"; REMOTE_URL="${REMOTE_URL%/}"; LOCAL_URL="${LOCAL_URL%/}"
   BACKUP_REL="wpship-backups/$SITE_NAME"   # relative to the server user's $HOME
 
-  SSH_OPTS=(-p "$SSH_PORT" -o ServerAliveInterval=30
-            -o ControlMaster=auto -o ControlPersist=60
-            -o "ControlPath=$HOME/.ssh/wpship-%r@%h:%p")
+  SSH_OPTS=(-p "$SSH_PORT" -o ServerAliveInterval=30)
+  # Reuse one SSH connection for speed — not on Windows, where Git Bash's
+  # ssh can't share connections (it fails with "Not a socket").
+  if ! is_windows; then
+    SSH_OPTS+=(-o ControlMaster=auto -o ControlPersist=60
+               -o "ControlPath=$HOME/.ssh/wpship-%r@%h:%p")
+  fi
   [[ -n $SSH_KEY ]] && SSH_OPTS+=(-i "${SSH_KEY/#\~/$HOME}")
   RSYNC_RSH="ssh$(printf ' %q' "${SSH_OPTS[@]}")"
   TARGET="$SSH_USER@$SSH_HOST"
@@ -136,6 +141,8 @@ lwp() {
   read -r -a cmd <<<"$LOCAL_WP"
   (cd "$SITE_ROOT" && "${cmd[@]}" "$@")
 }
+
+is_windows() { case "$(uname -s)" in MINGW*|MSYS*|CYGWIN*) return 0 ;; esac; return 1; }
 
 need() { command -v "$1" >/dev/null 2>&1 || die "'$1' is not installed on this computer. $2"; }
 
@@ -180,6 +187,86 @@ rsync_down() {
   rsync "${o[@]}" "$TARGET:$REMOTE_PATH/wp-content/$1/" "$SITE_ROOT/wp-content/$1/"
 }
 
+# ---- transfer layer: rsync when both sides have it, otherwise tar over SSH.
+# tar mode means wpship works in plain Git Bash on Windows, nothing to install.
+MODE=""
+TAR_EXCLUDES=(
+  --exclude=.git --exclude=.svn --exclude=node_modules --exclude=.DS_Store
+  --exclude=Thumbs.db --exclude='*.log' --exclude=.wpship
+  --exclude='sqlite-database-integration*'
+)
+# Prints "<md5> ./path" for every file in a folder, with the same exclusions.
+# Runs on both this computer and the server, so they can be compared.
+# shellcheck disable=SC2016  # expanded by the bash that runs it
+SUMS_SCRIPT='cd "$1" 2>/dev/null || exit 0
+h=md5sum; command -v md5sum >/dev/null 2>&1 || h="md5 -r"
+find . \( -name .git -o -name .svn -o -name node_modules -o -name .wpship \
+  -o -name "sqlite-database-integration*" \) -prune -o -type f \
+  ! -name .DS_Store ! -name Thumbs.db ! -name "*.log" -print0 \
+  | sort -z | xargs -0 -r $h | sed "s/  */ /"'
+
+ensure_mode() {
+  [[ -n $MODE ]] && return 0
+  case "$TRANSFER" in
+    rsync) MODE=rsync ;;
+    tar)   MODE=tar ;;
+    *)
+      if command -v rsync >/dev/null 2>&1 && remote 'command -v rsync >/dev/null 2>&1'; then
+        MODE=rsync
+      else
+        MODE=tar; dim "rsync isn't on both computers, so using tar over SSH (sends whole folders)."
+      fi ;;
+  esac
+  if [[ $MODE == tar ]] && ((DELETE)); then
+    die "--delete needs rsync on this computer and the server. Remove old files on the server by hand, or install rsync."
+  fi
+  return 0
+}
+
+# List files that differ. $1 = up|down, $2 = dir under wp-content
+preview() {
+  local dir="$1" d="$2"
+  if [[ $MODE == rsync ]]; then
+    local f=rsync_up; [[ $dir == down ]] && f=rsync_down
+    DRY=1 $f "$d" | grep -v -e '/$' -e '^created directory' -e '^$' || true
+    return 0
+  fi
+  local l="$CONFIG_DIR/.sums-local" r="$CONFIG_DIR/.sums-remote" src dst
+  bash -c "$SUMS_SCRIPT" _ "$SITE_ROOT/wp-content/$d" >"$l"
+  remote_script "$REMOTE_PATH/wp-content/$d" <<<"$SUMS_SCRIPT" >"$r"
+  if [[ $dir == up ]]; then src="$l"; dst="$r"; else src="$r"; dst="$l"; fi
+  awk 'FILENAME == ARGV[1] { have[substr($0,34)] = substr($0,1,32); next }
+       { f = substr($0,34); h = substr($0,1,32)
+         if (!(f in have)) print "+ " substr(f,3); else if (have[f] != h) print "~ " substr(f,3) }' "$dst" "$src"
+  rm -f "$l" "$r"
+}
+
+xfer_up() {   # $1 = dir under wp-content
+  if [[ $MODE == rsync ]]; then
+    rsync_up "$1" | grep -v -e '^$' -e '^total size' || true; return 0
+  fi
+  local dest="$REMOTE_PATH/wp-content/$1"
+  tar -C "$SITE_ROOT/wp-content/$1" -czf - "${TAR_EXCLUDES[@]}" . \
+    | remote "mkdir -p $(printf %q "$dest") && tar -xzf - --no-same-owner -C $(printf %q "$dest")"
+  echo "sent $(bash -c "$SUMS_SCRIPT" _ "$SITE_ROOT/wp-content/$1" | wc -l | tr -d ' ') files (tar)"
+}
+
+xfer_down() {
+  if [[ $MODE == rsync ]]; then
+    rsync_down "$1" | grep -v -e '^$' -e '^total size' || true; return 0
+  fi
+  local src="$REMOTE_PATH/wp-content/$1"
+  remote "test -d $(printf %q "$src")" || { echo "(not on server, skipped)"; return 0; }
+  mkdir -p "$SITE_ROOT/wp-content/$1"
+  remote "tar -C $(printf %q "$src") -czf -$(printf ' %q' "${TAR_EXCLUDES[@]}") ." \
+    | tar -xzf - --no-same-owner -C "$SITE_ROOT/wp-content/$1"
+  echo "received (tar)"
+}
+
+# Single files (database dumps): plain SSH streams, no rsync needed.
+copy_up()   { remote "cat > ~/$(printf %q "$2")" <"$1"; }   # local file → path under server $HOME
+copy_down() { remote "cat ~/$(printf %q "$1")" >"$2"; }     # path under server $HOME → local file
+
 sync_list() {  # dirs to sync for this run
   local d; for d in $SYNC_DIRS; do echo "$d"; done
   ((WITH_UPLOADS)) && echo uploads
@@ -221,7 +308,10 @@ cmd_init() {
   [[ -f $cfg ]] && source "$cfg"
 
   if [[ -z $LOCAL_URL ]]; then
-    command -v studio >/dev/null 2>&1 && [[ $SITE_ROOT == "$HOME/Studio/"* ]] && LOCAL_WP="studio wp"
+    if [[ $SITE_ROOT == "$HOME/Studio/"* || $SITE_ROOT == */Studio/* ]]; then
+      if command -v studio >/dev/null 2>&1; then LOCAL_WP="studio wp"
+      elif command -v studio.cmd >/dev/null 2>&1; then LOCAL_WP="studio.cmd wp"; fi
+    fi
     LOCAL_URL="$(cd "$SITE_ROOT" && read -r -a c <<<"$LOCAL_WP" && "${c[@]}" option get siteurl 2>/dev/null || true)"
   fi
   # shellcheck disable=SC2088  # kept literal; expanded when the config is loaded
@@ -259,17 +349,18 @@ cmd_init() {
 cmd_check() {
   load_config
   local fail=0
-  need ssh "Install OpenSSH."
-  need rsync "Install rsync (Windows: use WSL)."
-  ok "ssh and rsync found locally"
+  need ssh "Install OpenSSH (Windows: install Git for Windows and use Git Bash)."
+  need tar "Install tar."
+  ok "ssh and tar found locally"
 
   if ssh "${SSH_OPTS[@]}" -o BatchMode=yes -o ConnectTimeout=10 "$TARGET" true 2>/dev/null; then
     ok "SSH login works ($TARGET:$SSH_PORT)"
   else
     die "Can't log in to $TARGET over SSH with a key. Try: ssh -p $SSH_PORT $TARGET"
   fi
-  remote 'command -v rsync >/dev/null' && ok "rsync found on server" \
-    || { warn "rsync missing on server → sudo apt install rsync"; fail=1; }
+  ensure_mode
+  if [[ $MODE == rsync ]]; then ok "rsync on both ends: fast incremental uploads"
+  else ok "Transfer mode: tar over SSH (works everywhere; install rsync on both ends for faster pushes)"; fi
   if remote "command -v ${REMOTE_WP%% *} >/dev/null"; then
     ok "WP-CLI found on server ($(rwp cli version 2>/dev/null || echo '?'))"
   else
@@ -308,12 +399,12 @@ SH
 }
 
 cmd_status() {
-  load_config; DRY=1
-  info "Differences between local and ${B}$REMOTE_URL${N}  (lines starting with < would be uploaded)"
+  load_config; ensure_mode
+  info "Differences between local and ${B}$REMOTE_URL${N}  — files that would be uploaded"
   local d any=0 out
   while read -r d; do
     [[ -d $SITE_ROOT/wp-content/$d ]] || continue
-    out="$(rsync_up "$d" | grep -v -e '/$' -e '^created directory' || true)"
+    out="$(preview up "$d")"
     if [[ -n $out ]]; then any=1; echo "${B}wp-content/$d${N}"; sed 's/^/  /' <<<"$out"; fi
   done < <(sync_list)
   ((any)) || ok "Live themes and plugins match your local copy."
@@ -378,7 +469,7 @@ post_push_checks() {
 
 cmd_push() {
   load_config
-  need rsync "Install rsync (Windows: use WSL)."
+  ensure_mode
   local -a dirs=() d
   while read -r d; do [[ -d $SITE_ROOT/wp-content/$d ]] && dirs+=("$d"); done < <(sync_list)
   ((${#dirs[@]})) || die "Nothing to push: no ${SYNC_DIRS// /, } folder in wp-content."
@@ -397,7 +488,7 @@ cmd_push() {
 
   if ((DRY)); then
     info "Dry run — files that would change:"
-    for d in "${dirs[@]}"; do echo "${B}wp-content/$d${N}"; rsync_up "$d" | grep -v -e '/$' -e '^created directory' | sed 's/^/  /' || true; done
+    for d in "${dirs[@]}"; do echo "${B}wp-content/$d${N}"; preview up "$d" | sed 's/^/  /'; done
     ((WITH_DB)) && dim "  (database would be replaced)"
     return 0
   fi
@@ -410,14 +501,14 @@ cmd_push() {
   trap "printf '%s✗%s Push stopped partway. Restore the live site with: wpship rollback %s\\n' '$R' '$N' '$id' >&2" ERR
 
   for d in "${dirs[@]}"; do
-    info "Uploading wp-content/$d"; rsync_up "$d" | grep -v -e '^$' -e '^total size' | sed 's/^/  /'
+    info "Uploading wp-content/$d"; xfer_up "$d" | sed 's/^/  /'
   done
 
   if ((WITH_DB)); then
     local tmp="$CONFIG_DIR_NAME/outgoing.sql"
     info "Exporting local database"; local_db_export "$tmp"
     info "Uploading and importing database"
-    rsync -az -e "$RSYNC_RSH" "$SITE_ROOT/$tmp" "$TARGET:$BACKUP_REL/incoming.sql"
+    copy_up "$SITE_ROOT/$tmp" "$BACKUP_REL/incoming.sql"
     rm -f "${SITE_ROOT:?}/$tmp"
     remote "cd $(printf %q "$REMOTE_PATH") && $REMOTE_WP $WP_ROOT_FLAG db import ~/$(printf %q "$BACKUP_REL")/incoming.sql --quiet"
     remote "rm -f ~/$(printf %q "$BACKUP_REL")/incoming.sql"
@@ -430,7 +521,7 @@ cmd_push() {
 
 cmd_pull() {
   load_config
-  need rsync "Install rsync (Windows: use WSL)."
+  ensure_mode
   local -a dirs=() d
   while read -r d; do dirs+=("$d"); done < <(sync_list)
 
@@ -438,12 +529,12 @@ cmd_pull() {
   echo "  Download: ${dirs[*]}$( ((DELETE)) && echo '  (and DELETE local files missing on server)')"
   ((WITH_DB)) && echo "  Replace LOCAL database with live (local DB is saved to .wpship/local-backups first)"
   if ((DRY)); then
-    for d in "${dirs[@]}"; do echo "${B}wp-content/$d${N}"; rsync_down "$d" | grep -v -e '/$' -e '^created directory' | sed 's/^/  /' || true; done
+    for d in "${dirs[@]}"; do echo "${B}wp-content/$d${N}"; preview down "$d" | sed 's/^/  /'; done
     return 0
   fi
   confirm "Overwrite local files with the live versions?"
 
-  for d in "${dirs[@]}"; do info "Downloading wp-content/$d"; rsync_down "$d" | grep -v -e '^$' -e '^total size' | sed 's/^/  /'; done
+  for d in "${dirs[@]}"; do info "Downloading wp-content/$d"; xfer_down "$d" | sed 's/^/  /'; done
 
   if ((WITH_DB)); then
     [[ -n $LOCAL_URL ]] || die "LOCAL_URL is empty in config; needed for --db."
@@ -455,7 +546,7 @@ cmd_pull() {
     remote "mkdir -p ~/$(printf %q "$BACKUP_REL")"
     remote "cd $(printf %q "$REMOTE_PATH") && $REMOTE_WP $WP_ROOT_FLAG db export ~/$(printf %q "$BACKUP_REL")/outgoing.sql --quiet"
     local tmp="$CONFIG_DIR_NAME/incoming.sql"
-    rsync -az -e "$RSYNC_RSH" "$TARGET:$BACKUP_REL/outgoing.sql" "$SITE_ROOT/$tmp"
+    copy_down "$BACKUP_REL/outgoing.sql" "$SITE_ROOT/$tmp"
     remote "rm -f ~/$(printf %q "$BACKUP_REL")/outgoing.sql"
     info "Importing into local site"; local_db_import "$tmp"; rm -f "${SITE_ROOT:?}/$tmp"
     replace_urls local "$REMOTE_URL" "$LOCAL_URL"

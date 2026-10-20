@@ -14,7 +14,7 @@ from the local site folder (the one containing `wp-config.php`), or pass
 | Command | What it does |
 |---|---|
 | `init` | Interactive: saves server details to `.wpship/config` (no passwords) |
-| `check` | Verifies SSH key login, rsync, WP-CLI, remote WordPress, siteurl |
+| `check` | Verifies SSH key login, transfer mode (rsync or tar), WP-CLI, remote WordPress, siteurl |
 | `install-wpcli` | Installs WP-CLI to `~/.local/bin/wp` on the server |
 | `status` | Lists theme/plugin files that differ (local vs live) |
 | `push [--db] [--uploads] [--delete]` | Backs up live, then uploads |
@@ -59,6 +59,7 @@ KEEP_BACKUPS=5
 
 ## Known limits (say so if relevant)
 
-- Needs SSH key access and rsync on both ends. Shared hosting without SSH is not supported yet. On Windows, run inside WSL.
+- Needs SSH key access. Shared hosting without SSH is not supported yet. On Windows it runs in Git Bash (or WSL); Studio sites live at `/c/Users/NAME/Studio/SITE`, and Studio's CLI may be `studio.cmd wp`.
+- Without rsync on both ends, wpship uses tar over SSH: pushes send whole folders and `--delete` is refused. Suggest `sudo apt install rsync` on the server if pushes are slow.
 - Local and live table prefixes must match for `--db` (the tool refuses otherwise).
 - Studio sites use SQLite locally; DB export/import tries `wp db` then `wp sqlite`. If both fail, tell the user and push code only.
