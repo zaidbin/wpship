@@ -145,6 +145,8 @@ wpship has no servers or accounts of its own and sends nothing to the plugin aut
 
 wpship never reads, copies or sends SSH keys or passwords; logging in is handled by your system's `ssh`. After a push it requests your live site's homepage once to check it loads.
 
+**Privacy:** see the full [Privacy Policy](PRIVACY.md).
+
 ## Not supported yet
 
 - Shared hosting without SSH (FTP/cPanel-only)
