@@ -32,7 +32,7 @@ local site (Studio / LocalWP / any)  ──wpship push──▶  your server
 ## Requirements
 
 - **Your computer:** bash, `ssh`, `tar`, and WP-CLI for your local site (`studio wp` works for WordPress Studio). macOS and Linux work as-is. On **Windows**, use **Git Bash** (comes with [Git for Windows](https://git-scm.com/download/win)); WSL works too.
-- **Your server:** SSH key login and WordPress already installed. WP-CLI is optional — `wpship install-wpcli` adds it.
+- **Your server:** SSH key login, WordPress already installed, and WP-CLI (`wpship install-wpcli` shows the official install steps).
 - **Optional: `rsync`** on both ends. With it, pushes send only changed files and `--delete` works. Without it, wpship streams whole folders with `tar` over SSH, which is slower but needs nothing extra installed. Force a mode with `TRANSFER=rsync` or `TRANSFER=tar` in the config.
 
 ### Windows (Git Bash)
@@ -101,7 +101,7 @@ Or just talk: *"I added a plugin locally, ship it to the droplet."*
 ```
 init            Save server details (.wpship/config)
 check           Test SSH, transfer mode, WP-CLI, remote WordPress
-install-wpcli   Install WP-CLI on the server
+install-wpcli   Show how to install WP-CLI on the server
 status          Files that differ (local vs live)
 push            Backup, then upload themes/plugins/mu-plugins
 pull            Download from live
@@ -120,7 +120,7 @@ rollback [ID]   Restore a backup (default: latest)
 SSH_HOST=203.0.113.10
 SSH_USER=root
 SSH_PORT=22
-SSH_KEY=~/.ssh/id_ed25519
+SSH_KEY=                         # optional: a specific key file; blank = your default SSH key
 REMOTE_PATH=/var/www/html
 REMOTE_URL=https://example.com
 LOCAL_URL=http://localhost:8881

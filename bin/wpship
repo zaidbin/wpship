@@ -7,7 +7,7 @@
 
 set -Eeuo pipefail
 
-VERSION="0.2.0"
+VERSION="0.2.1"
 CONFIG_DIR_NAME=".wpship"
 
 # ---------------------------------------------------------------- output ----
@@ -53,7 +53,7 @@ ${B}Usage:${N} wpship <command> [options]
 ${B}Setup${N}
   init             Save server details for this site (.wpship/config)
   check            Test SSH, WP-CLI and the remote WordPress install
-  install-wpcli    Install WP-CLI on the server (if it's missing)
+  install-wpcli    How to install WP-CLI on the server (if it's missing)
 
 ${B}Everyday${N}
   status           Show which theme/plugin files differ (local vs live)
@@ -115,13 +115,13 @@ load_config() {
   # ssh can't share connections (it fails with "Not a socket").
   if ! is_windows; then
     SSH_OPTS+=(-o ControlMaster=auto -o ControlPersist=60
-               -o "ControlPath=$HOME/.ssh/wpship-%r@%h:%p")
+               -o "ControlPath=$HOME/.wpship-ssh/%r@%h:%p")
+    mkdir -p "$HOME/.wpship-ssh"; chmod 700 "$HOME/.wpship-ssh"
   fi
   [[ -n $SSH_KEY ]] && SSH_OPTS+=(-i "${SSH_KEY/#\~/$HOME}")
   RSYNC_RSH="ssh$(printf ' %q' "${SSH_OPTS[@]}")"
   TARGET="$SSH_USER@$SSH_HOST"
   WP_ROOT_FLAG=""; [[ $SSH_USER == root ]] && WP_ROOT_FLAG="--allow-root"
-  mkdir -p "$HOME/.ssh"
 }
 
 # -------------------------------------------------------------- transport --
@@ -314,8 +314,6 @@ cmd_init() {
     fi
     LOCAL_URL="$(cd "$SITE_ROOT" && read -r -a c <<<"$LOCAL_WP" && "${c[@]}" option get siteurl 2>/dev/null || true)"
   fi
-  # shellcheck disable=SC2088  # kept literal; expanded when the config is loaded
-  [[ -z $SSH_KEY && -f $HOME/.ssh/id_ed25519 ]] && SSH_KEY="~/.ssh/id_ed25519"
 
   [[ -t 0 ]] || die "init is interactive; or write $cfg by hand (see README)."
   info "Setting up wpship for ${B}$(basename "$SITE_ROOT")${N}  (press Enter to keep [default])"
@@ -323,7 +321,7 @@ cmd_init() {
   ask SSH_HOST     "Server IP or hostname"
   ask SSH_USER     "SSH user"
   ask SSH_PORT     "SSH port"
-  ask SSH_KEY      "SSH private key (blank = ssh-agent/default)"
+  ask SSH_KEY      "Key file, only if not your default SSH key (blank = default)"
   ask REMOTE_PATH  "WordPress folder on server (has wp-config.php)"
   ask REMOTE_URL   "Live site URL (e.g. https://example.com)"
   ask LOCAL_URL    "Local site URL"
@@ -364,7 +362,7 @@ cmd_check() {
   if remote "command -v ${REMOTE_WP%% *} >/dev/null"; then
     ok "WP-CLI found on server ($(rwp cli version 2>/dev/null || echo '?'))"
   else
-    warn "WP-CLI missing on server → run: wpship install-wpcli"; fail=1
+    warn "WP-CLI missing on server → see: wpship install-wpcli"; fail=1
   fi
   if remote "test -f $(printf %q "$REMOTE_PATH/wp-config.php")"; then
     ok "WordPress found at $REMOTE_PATH"
@@ -385,17 +383,19 @@ cmd_check() {
 
 cmd_install_wpcli() {
   load_config
-  info "Installing WP-CLI to ~/.local/bin/wp on the server"
-  remote_script <<'SH'
-set -e
-mkdir -p "$HOME/.local/bin"
-curl -fsSL -o "$HOME/.local/bin/wp" https://raw.githubusercontent.com/wp-cli/builds/gh-pages/phar/wp-cli.phar
-chmod +x "$HOME/.local/bin/wp"
-"$HOME/.local/bin/wp" --info --allow-root | head -3
-SH
-  # shellcheck disable=SC2088  # tilde must expand on the server, not here
-  sed -i.bak "s|^REMOTE_WP=.*|REMOTE_WP='~/.local/bin/wp'|" "$CONFIG_FILE" && rm -f "$CONFIG_FILE.bak"
-  ok "Installed. Config updated to use ~/.local/bin/wp"
+  # wpship doesn't download and run installers itself; these are the official
+  # WP-CLI install steps (https://wp-cli.org) for you to run on the server.
+  info "wpship doesn't install WP-CLI for you. On the server, run:"
+  cat <<STEPS
+
+  ssh -p $SSH_PORT $TARGET
+  curl -O https://raw.githubusercontent.com/wp-cli/builds/gh-pages/phar/wp-cli.phar
+  php wp-cli.phar --info
+  chmod +x wp-cli.phar && sudo mv wp-cli.phar /usr/local/bin/wp
+  exit
+
+STEPS
+  echo "Then run: ${B}wpship check${N}"
 }
 
 cmd_status() {

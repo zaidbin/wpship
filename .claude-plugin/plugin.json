@@ -1,6 +1,6 @@
 {
   "name": "wpship",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Ship a local WordPress site (e.g. WordPress Studio) to any VPS or host over SSH \u2014 with automatic backups, dry runs and one-command rollback.",
   "author": {
     "name": "A. Zaid Niazi"
