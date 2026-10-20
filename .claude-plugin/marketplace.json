@@ -1,0 +1,11 @@
+{
+  "name": "wpship",
+  "owner": { "name": "A. Zaid Niazi" },
+  "plugins": [
+    {
+      "name": "wpship",
+      "source": "./",
+      "description": "Ship a local WordPress site to any SSH server with backups and rollback."
+    }
+  ]
+}

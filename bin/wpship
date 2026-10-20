@@ -1,0 +1,519 @@
+#!/usr/bin/env bash
+# wpship — ship a local WordPress site to any SSH server, safely.
+# https://github.com/zaidbin/wpship   ·   MIT License
+#
+# Run from inside a local WordPress site folder (the one with wp-config.php),
+# e.g. a WordPress Studio site in ~/Studio/my-site.
+
+set -Eeuo pipefail
+
+VERSION="0.1.0"
+CONFIG_DIR_NAME=".wpship"
+
+# ---------------------------------------------------------------- output ----
+if [[ -t 1 ]]; then
+  B=$'\e[1m'; D=$'\e[2m'; R=$'\e[31m'; G=$'\e[32m'; Y=$'\e[33m'; N=$'\e[0m'
+else
+  B=""; D=""; R=""; G=""; Y=""; N=""
+fi
+info() { printf '%s==>%s %s\n' "$B" "$N" "$*"; }
+ok()   { printf '%s✓%s %s\n' "$G" "$N" "$*"; }
+warn() { printf '%s!%s %s\n' "$Y" "$N" "$*" >&2; }
+die()  { printf '%s✗%s %s\n' "$R" "$N" "$*" >&2; exit 1; }
+dim()  { printf '%s%s%s\n' "$D" "$*" "$N"; }
+
+# ----------------------------------------------------------------- flags ----
+YES=0; DRY=0; WITH_DB=0; WITH_UPLOADS=0; DELETE=0; SITE_ROOT=""
+ARGS=()
+
+parse_flags() {
+  while (($#)); do
+    case "$1" in
+      -y|--yes)      YES=1 ;;
+      -n|--dry-run)  DRY=1 ;;
+      --db)          WITH_DB=1 ;;
+      --uploads)     WITH_UPLOADS=1 ;;
+      --delete)      DELETE=1 ;;
+      --path)        shift; SITE_ROOT="${1:-}"; [[ -n $SITE_ROOT ]] || die "--path needs a folder" ;;
+      --path=*)      SITE_ROOT="${1#--path=}" ;;
+      -h|--help)     usage; exit 0 ;;
+      -*)            die "Unknown option: $1 (see: wpship help)" ;;
+      *)             ARGS+=("$1") ;;
+    esac
+    shift
+  done
+}
+
+usage() {
+  cat <<EOF
+${B}wpship${N} $VERSION — ship a local WordPress site to any SSH server
+
+${B}Usage:${N} wpship <command> [options]
+
+${B}Setup${N}
+  init             Save server details for this site (.wpship/config)
+  check            Test SSH, rsync, WP-CLI and the remote WordPress install
+  install-wpcli    Install WP-CLI on the server (if it's missing)
+
+${B}Everyday${N}
+  status           Show which theme/plugin files differ (local vs live)
+  push             Back up live, then upload themes, plugins, mu-plugins
+  pull             Download live themes/plugins (and optionally DB/uploads)
+
+${B}Safety net${N}
+  backup           Back up the live database + wp-content now
+  backups          List backups on the server
+  rollback [ID]    Restore a backup (default: the latest one)
+
+${B}Options${N}
+  --db             Also push/pull the database (asks you to type the domain)
+  --uploads        Also push/pull wp-content/uploads
+  --delete         Remove server files that no longer exist locally
+  -n, --dry-run    Show what would happen, change nothing
+  -y, --yes        Don't ask for confirmation (DB push still needs --yes)
+  --path DIR       Site folder (default: current folder or a parent)
+EOF
+}
+
+# ----------------------------------------------------------- site & config --
+find_site_root() {
+  local d="${SITE_ROOT:-$PWD}"
+  d="$(cd "$d" 2>/dev/null && pwd)" || die "Folder not found: ${SITE_ROOT}"
+  while [[ $d != "/" ]]; do
+    if [[ -f $d/wp-config.php || -f $d/wp-load.php || -d $d/$CONFIG_DIR_NAME ]]; then
+      SITE_ROOT="$d"; return 0
+    fi
+    d="$(dirname "$d")"
+  done
+  die "Not inside a WordPress site folder (no wp-config.php found). Use --path."
+}
+
+load_config() {
+  find_site_root
+  CONFIG_DIR="$SITE_ROOT/$CONFIG_DIR_NAME"
+  CONFIG_FILE="$CONFIG_DIR/config"
+  [[ -f $CONFIG_FILE ]] || die "No config yet. Run: wpship init"
+
+  # defaults
+  SITE_NAME="$(basename "$SITE_ROOT")"
+  SSH_HOST=""; SSH_USER="root"; SSH_PORT="22"; SSH_KEY=""
+  REMOTE_PATH=""; REMOTE_URL=""; LOCAL_URL=""
+  LOCAL_WP="wp"; REMOTE_WP="wp"; REMOTE_OWNER=""
+  SYNC_DIRS="themes plugins mu-plugins"; KEEP_BACKUPS="5"
+  # shellcheck source=/dev/null
+  source "$CONFIG_FILE"
+
+  for v in SSH_HOST SSH_USER REMOTE_PATH REMOTE_URL; do
+    [[ -n ${!v} ]] || die "$v is empty in $CONFIG_FILE (run: wpship init)"
+  done
+  REMOTE_PATH="${REMOTE_PATH%/}"; REMOTE_URL="${REMOTE_URL%/}"; LOCAL_URL="${LOCAL_URL%/}"
+  BACKUP_REL="wpship-backups/$SITE_NAME"   # relative to the server user's $HOME
+
+  SSH_OPTS=(-p "$SSH_PORT" -o ServerAliveInterval=30
+            -o ControlMaster=auto -o ControlPersist=60
+            -o "ControlPath=$HOME/.ssh/wpship-%r@%h:%p")
+  [[ -n $SSH_KEY ]] && SSH_OPTS+=(-i "${SSH_KEY/#\~/$HOME}")
+  RSYNC_RSH="ssh$(printf ' %q' "${SSH_OPTS[@]}")"
+  TARGET="$SSH_USER@$SSH_HOST"
+  WP_ROOT_FLAG=""; [[ $SSH_USER == root ]] && WP_ROOT_FLAG="--allow-root"
+  mkdir -p "$HOME/.ssh"
+}
+
+# -------------------------------------------------------------- transport --
+remote() { ssh "${SSH_OPTS[@]}" "$TARGET" "$@"; }
+
+# run a bash script (stdin) on the server with safe positional args
+remote_script() { remote "bash -s --$(printf ' %q' "$@")"; }
+
+# WP-CLI on the server, inside the site folder
+rwp() {
+  remote "cd $(printf %q "$REMOTE_PATH") && $REMOTE_WP $WP_ROOT_FLAG$(printf ' %q' "$@")"
+}
+
+# WP-CLI locally (LOCAL_WP may be two words, e.g. "studio wp")
+lwp() {
+  local -a cmd
+  read -r -a cmd <<<"$LOCAL_WP"
+  (cd "$SITE_ROOT" && "${cmd[@]}" "$@")
+}
+
+need() { command -v "$1" >/dev/null 2>&1 || die "'$1' is not installed on this computer. $2"; }
+
+confirm() {
+  ((YES)) && return 0
+  [[ -t 0 ]] || die "Needs confirmation; re-run with --yes to proceed non-interactively."
+  local a; read -r -p "$1 [y/N] " a
+  [[ $a == y || $a == Y || $a == yes ]] || die "Cancelled."
+}
+
+# The DB is the dangerous part: make people type the domain, every time.
+confirm_db() {
+  local domain="${REMOTE_URL#*://}"; domain="${domain%%/*}"
+  warn "This REPLACES the live database of $domain with your local one."
+  warn "Comments, orders, users or posts created on the live site since your"
+  warn "last pull will be lost (a backup is taken first so you can roll back)."
+  if ((YES)); then return 0; fi
+  [[ -t 0 ]] || die "DB push needs --yes when not run interactively."
+  local a; read -r -p "Type ${B}$domain${N} to continue: " a
+  [[ $a == "$domain" ]] || die "Domain didn't match. Nothing was changed."
+}
+
+RSYNC_EXCLUDES=(
+  --exclude=.git/ --exclude=.svn/ --exclude=node_modules/ --exclude=.DS_Store
+  --exclude=Thumbs.db --exclude='*.log' --exclude=.wpship/
+  # WordPress Studio's SQLite engine — must never reach a MySQL server
+  --exclude='/sqlite-database-integration*/'
+)
+
+rsync_up() {   # $1 = dir under wp-content
+  local -a o=(-az --human-readable "${RSYNC_EXCLUDES[@]}" -e "$RSYNC_RSH")
+  ((DELETE)) && o+=(--delete)
+  ((DRY)) && o+=(--dry-run --itemize-changes) || o+=(--info=stats1)
+  rsync "${o[@]}" "$SITE_ROOT/wp-content/$1/" "$TARGET:$REMOTE_PATH/wp-content/$1/"
+}
+
+rsync_down() {
+  local -a o=(-az --human-readable "${RSYNC_EXCLUDES[@]}" -e "$RSYNC_RSH")
+  ((DELETE)) && o+=(--delete)
+  ((DRY)) && o+=(--dry-run --itemize-changes) || o+=(--info=stats1)
+  mkdir -p "$SITE_ROOT/wp-content/$1"
+  rsync "${o[@]}" "$TARGET:$REMOTE_PATH/wp-content/$1/" "$SITE_ROOT/wp-content/$1/"
+}
+
+sync_list() {  # dirs to sync for this run
+  local d; for d in $SYNC_DIRS; do echo "$d"; done
+  ((WITH_UPLOADS)) && echo uploads
+  return 0
+}
+
+# Replace one site URL with another, including JSON-escaped copies in blocks
+replace_urls() {  # $1 = local|remote  $2 = from  $3 = to
+  local where="$1" from="$2" to="$3" fn
+  [[ $where == remote ]] && fn=rwp || fn=lwp
+  [[ -n $from && -n $to && $from != "$to" ]] || return 0
+  info "Replacing $from → $to"
+  $fn search-replace "$from" "$to" --all-tables-with-prefix --precise --skip-columns=guid --report-changed-only
+  $fn search-replace "${from//\//\\/}" "${to//\//\\/}" --all-tables-with-prefix --precise --skip-columns=guid --report-changed-only >/dev/null || true
+}
+
+# Paths are relative to the site folder: Studio runs WP-CLI in a sandbox that
+# can only see the site folder, so /tmp paths would fail there.
+local_db_export() {   # $1 = file relative to site root. MySQL or Studio (SQLite)
+  if lwp db export "$1" >/dev/null 2>&1; then return 0; fi
+  if lwp sqlite export "$1" >/dev/null 2>&1; then return 0; fi
+  die "Couldn't export the local database (tried 'db export' and 'sqlite export')."
+}
+
+local_db_import() {
+  if lwp db import "$1" >/dev/null 2>&1; then return 0; fi
+  if lwp sqlite import "$1" >/dev/null 2>&1; then return 0; fi
+  die "Couldn't import into the local database (tried 'db import' and 'sqlite import')."
+}
+
+# ------------------------------------------------------------- commands ----
+cmd_init() {
+  find_site_root
+  local cfg_dir="$SITE_ROOT/$CONFIG_DIR_NAME" cfg="$SITE_ROOT/$CONFIG_DIR_NAME/config"
+  # existing values become defaults
+  local SSH_HOST="" SSH_USER="root" SSH_PORT="22" SSH_KEY="" REMOTE_PATH="/var/www/html"
+  local REMOTE_URL="" LOCAL_URL="" LOCAL_WP="wp" REMOTE_WP="wp" REMOTE_OWNER="www-data:www-data"
+  # shellcheck source=/dev/null
+  [[ -f $cfg ]] && source "$cfg"
+
+  if [[ -z $LOCAL_URL ]]; then
+    command -v studio >/dev/null 2>&1 && [[ $SITE_ROOT == "$HOME/Studio/"* ]] && LOCAL_WP="studio wp"
+    LOCAL_URL="$(cd "$SITE_ROOT" && read -r -a c <<<"$LOCAL_WP" && "${c[@]}" option get siteurl 2>/dev/null || true)"
+  fi
+  # shellcheck disable=SC2088  # kept literal; expanded when the config is loaded
+  [[ -z $SSH_KEY && -f $HOME/.ssh/id_ed25519 ]] && SSH_KEY="~/.ssh/id_ed25519"
+
+  [[ -t 0 ]] || die "init is interactive; or write $cfg by hand (see README)."
+  info "Setting up wpship for ${B}$(basename "$SITE_ROOT")${N}  (press Enter to keep [default])"
+  ask() { local v; read -r -p "  $2 [${!1}]: " v; [[ -n $v ]] && printf -v "$1" '%s' "$v"; return 0; }
+  ask SSH_HOST     "Server IP or hostname"
+  ask SSH_USER     "SSH user"
+  ask SSH_PORT     "SSH port"
+  ask SSH_KEY      "SSH private key (blank = ssh-agent/default)"
+  ask REMOTE_PATH  "WordPress folder on server (has wp-config.php)"
+  ask REMOTE_URL   "Live site URL (e.g. https://example.com)"
+  ask LOCAL_URL    "Local site URL"
+  ask LOCAL_WP     "Local WP-CLI command (Studio: 'studio wp')"
+  ask REMOTE_WP    "WP-CLI command on server"
+  ask REMOTE_OWNER "File owner on server after push (blank = don't change)"
+
+  mkdir -p "$cfg_dir"; chmod 700 "$cfg_dir"
+  {
+    echo "# wpship config — this file stays on your computer. No passwords here."
+    for v in SSH_HOST SSH_USER SSH_PORT SSH_KEY REMOTE_PATH REMOTE_URL LOCAL_URL LOCAL_WP REMOTE_WP REMOTE_OWNER; do
+      printf '%s=%q\n' "$v" "${!v}"
+    done
+    echo "SYNC_DIRS=\"themes plugins mu-plugins\""
+    echo "KEEP_BACKUPS=5"
+  } >"$cfg"
+  chmod 600 "$cfg"
+  echo '*' >"$cfg_dir/.gitignore"
+  ok "Saved $cfg"
+  echo "Next: ${B}wpship check${N}"
+}
+
+cmd_check() {
+  load_config
+  local fail=0
+  need ssh "Install OpenSSH."
+  need rsync "Install rsync (Windows: use WSL)."
+  ok "ssh and rsync found locally"
+
+  if ssh "${SSH_OPTS[@]}" -o BatchMode=yes -o ConnectTimeout=10 "$TARGET" true 2>/dev/null; then
+    ok "SSH login works ($TARGET:$SSH_PORT)"
+  else
+    die "Can't log in to $TARGET over SSH with a key. Try: ssh -p $SSH_PORT $TARGET"
+  fi
+  remote 'command -v rsync >/dev/null' && ok "rsync found on server" \
+    || { warn "rsync missing on server → sudo apt install rsync"; fail=1; }
+  if remote "command -v ${REMOTE_WP%% *} >/dev/null"; then
+    ok "WP-CLI found on server ($(rwp cli version 2>/dev/null || echo '?'))"
+  else
+    warn "WP-CLI missing on server → run: wpship install-wpcli"; fail=1
+  fi
+  if remote "test -f $(printf %q "$REMOTE_PATH/wp-config.php")"; then
+    ok "WordPress found at $REMOTE_PATH"
+    local live; live="$(rwp option get siteurl 2>/dev/null || true)"
+    if [[ -n $live ]]; then
+      [[ ${live%/} == "$REMOTE_URL" ]] && ok "Live siteurl matches ($live)" \
+        || warn "Live siteurl is '$live' but config says '$REMOTE_URL'"
+      local lp rp; lp="$(lwp db prefix 2>/dev/null || true)"; rp="$(rwp db prefix 2>/dev/null || true)"
+      [[ -n $lp && -n $rp && $lp != "$rp" ]] && warn "Table prefix differs (local '$lp', live '$rp'): DB push will be refused."
+    fi
+  else
+    warn "No wp-config.php in $REMOTE_PATH on the server"; fail=1
+  fi
+  if [[ -n $LOCAL_URL ]]; then ok "Local URL: $LOCAL_URL"; else warn "LOCAL_URL is empty (needed for --db)"; fi
+  ((fail)) && die "Fix the items above, then run wpship check again."
+  ok "All good. Try: ${B}wpship status${N}"
+}
+
+cmd_install_wpcli() {
+  load_config
+  info "Installing WP-CLI to ~/.local/bin/wp on the server"
+  remote_script <<'SH'
+set -e
+mkdir -p "$HOME/.local/bin"
+curl -fsSL -o "$HOME/.local/bin/wp" https://raw.githubusercontent.com/wp-cli/builds/gh-pages/phar/wp-cli.phar
+chmod +x "$HOME/.local/bin/wp"
+"$HOME/.local/bin/wp" --info --allow-root | head -3
+SH
+  # shellcheck disable=SC2088  # tilde must expand on the server, not here
+  sed -i.bak "s|^REMOTE_WP=.*|REMOTE_WP='~/.local/bin/wp'|" "$CONFIG_FILE" && rm -f "$CONFIG_FILE.bak"
+  ok "Installed. Config updated to use ~/.local/bin/wp"
+}
+
+cmd_status() {
+  load_config; DRY=1
+  info "Differences between local and ${B}$REMOTE_URL${N}  (lines starting with < would be uploaded)"
+  local d any=0 out
+  while read -r d; do
+    [[ -d $SITE_ROOT/wp-content/$d ]] || continue
+    out="$(rsync_up "$d" | grep -v -e '/$' -e '^created directory' || true)"
+    if [[ -n $out ]]; then any=1; echo "${B}wp-content/$d${N}"; sed 's/^/  /' <<<"$out"; fi
+  done < <(sync_list)
+  ((any)) || ok "Live themes and plugins match your local copy."
+}
+
+do_backup() {  # $1 = include uploads (0/1). Prints backup ID
+  local ts; ts="$(date +%Y%m%d-%H%M%S)"
+  while remote "test -e ~/$(printf %q "$BACKUP_REL/$ts")"; do sleep 1; ts="$(date +%Y%m%d-%H%M%S)"; done
+  info "Backing up live site (database + wp-content) → ~/$BACKUP_REL/$ts" >&2
+  remote_script "$REMOTE_PATH" "$BACKUP_REL" "$ts" "$REMOTE_WP $WP_ROOT_FLAG" "$KEEP_BACKUPS" "$1" >&2 <<'SH'
+set -Eeuo pipefail
+path="$1"; dir="$HOME/$2"; ts="$3"; wp="$4"; keep="$5"; uploads="$6"
+mkdir -p "$dir/$ts"; chmod 700 "$HOME/wpship-backups" "$dir"
+cd "$path"
+eval "$wp db export \"\$dir/\$ts/db.sql\" --quiet"
+ex=(--exclude=wp-content/cache)
+[ "$uploads" = 1 ] || ex+=(--exclude=wp-content/uploads)
+tar -czf "$dir/$ts/wp-content.tar.gz" "${ex[@]}" wp-content
+echo "uploads=$uploads" >"$dir/$ts/meta"
+# keep only the newest $keep backups
+ls -1d "$dir"/2*/ 2>/dev/null | sort | head -n -"$keep" | xargs -r rm -rf
+echo "  size: $(du -sh "$dir/$ts" | cut -f1)"
+SH
+  echo "$ts"
+}
+
+cmd_backup() {
+  load_config
+  ((DRY)) && { info "Would back up the live DB and wp-content."; return; }
+  local id; id="$(do_backup "$WITH_UPLOADS")"
+  ok "Backup $id saved on the server"
+}
+
+cmd_backups() {
+  load_config
+  remote_script "$BACKUP_REL" <<'SH'
+dir="$HOME/$1"
+ls -1d "$dir"/2*/ 2>/dev/null | sort -r | while read -r b; do
+  id="$(basename "$b")"; sz="$(du -sh "$b" | cut -f1)"
+  up="$(grep -q uploads=1 "$b/meta" 2>/dev/null && echo '+uploads' || echo '')"
+  echo "  $id   $sz $up"
+done
+[ -n "$(ls -A "$dir" 2>/dev/null)" ] || echo "  (no backups yet)"
+SH
+}
+
+post_push_checks() {
+  if [[ -n $REMOTE_OWNER ]]; then
+    remote "chown -R $(printf %q "$REMOTE_OWNER") $(printf %q "$REMOTE_PATH/wp-content")" 2>/dev/null \
+      && ok "File owner set to $REMOTE_OWNER" \
+      || warn "Couldn't chown to $REMOTE_OWNER (SSH user may lack permission)"
+  fi
+  rwp cache flush >/dev/null 2>&1 || true
+  rwp rewrite flush >/dev/null 2>&1 || true
+  ok "Cache and permalinks flushed"
+  if command -v curl >/dev/null 2>&1; then
+    local code; code="$(curl -s -o /dev/null -w '%{http_code}' -L --max-time 20 "$REMOTE_URL/" || echo 000)"
+    if [[ $code == 200 ]]; then ok "Live site responds (HTTP 200)"
+    else warn "Live site returned HTTP $code — check it now. Undo with: ${B}wpship rollback${N}"; return 1; fi
+  fi
+}
+
+cmd_push() {
+  load_config
+  need rsync "Install rsync (Windows: use WSL)."
+  local -a dirs=() d
+  while read -r d; do [[ -d $SITE_ROOT/wp-content/$d ]] && dirs+=("$d"); done < <(sync_list)
+  ((${#dirs[@]})) || die "Nothing to push: no ${SYNC_DIRS// /, } folder in wp-content."
+
+  if ((WITH_DB)); then
+    [[ -n $LOCAL_URL ]] || die "LOCAL_URL is empty in config; needed for --db."
+    local lp rp; lp="$(lwp db prefix)"; rp="$(rwp db prefix)"
+    [[ $lp == "$rp" ]] || die "Table prefix differs (local '$lp', live '$rp'). Refusing DB push."
+  fi
+
+  info "Push plan for ${B}$REMOTE_URL${N}"
+  echo "  1. Back up live database + wp-content"
+  echo "  2. Upload: ${dirs[*]}$( ((DELETE)) && echo '  (and DELETE server files missing locally)')"
+  ((WITH_DB)) && echo "  3. Replace live database with local, then fix URLs $LOCAL_URL → $REMOTE_URL"
+  echo "  $( ((WITH_DB)) && echo 4 || echo 3). Fix file owner, flush caches, check the site loads"
+
+  if ((DRY)); then
+    info "Dry run — files that would change:"
+    for d in "${dirs[@]}"; do echo "${B}wp-content/$d${N}"; rsync_up "$d" | grep -v -e '/$' -e '^created directory' | sed 's/^/  /' || true; done
+    ((WITH_DB)) && dim "  (database would be replaced)"
+    return 0
+  fi
+
+  if ((WITH_DB)); then confirm_db; else confirm "Go ahead?"; fi
+
+  local id; id="$(do_backup "$WITH_UPLOADS")"
+  ok "Backup $id"
+  # shellcheck disable=SC2064  # expand $id now
+  trap "printf '%s✗%s Push stopped partway. Restore the live site with: wpship rollback %s\\n' '$R' '$N' '$id' >&2" ERR
+
+  for d in "${dirs[@]}"; do
+    info "Uploading wp-content/$d"; rsync_up "$d" | grep -v -e '^$' -e '^total size' | sed 's/^/  /'
+  done
+
+  if ((WITH_DB)); then
+    local tmp="$CONFIG_DIR_NAME/outgoing.sql"
+    info "Exporting local database"; local_db_export "$tmp"
+    info "Uploading and importing database"
+    rsync -az -e "$RSYNC_RSH" "$SITE_ROOT/$tmp" "$TARGET:$BACKUP_REL/incoming.sql"
+    rm -f "${SITE_ROOT:?}/$tmp"
+    remote "cd $(printf %q "$REMOTE_PATH") && $REMOTE_WP $WP_ROOT_FLAG db import ~/$(printf %q "$BACKUP_REL")/incoming.sql --quiet"
+    remote "rm -f ~/$(printf %q "$BACKUP_REL")/incoming.sql"
+    replace_urls remote "$LOCAL_URL" "$REMOTE_URL"
+    warn "Live admin logins are now your LOCAL users/passwords."
+  fi
+
+  post_push_checks && ok "Pushed to $REMOTE_URL  (undo: wpship rollback $id)"
+}
+
+cmd_pull() {
+  load_config
+  need rsync "Install rsync (Windows: use WSL)."
+  local -a dirs=() d
+  while read -r d; do dirs+=("$d"); done < <(sync_list)
+
+  info "Pull plan from ${B}$REMOTE_URL${N}"
+  echo "  Download: ${dirs[*]}$( ((DELETE)) && echo '  (and DELETE local files missing on server)')"
+  ((WITH_DB)) && echo "  Replace LOCAL database with live (local DB is saved to .wpship/local-backups first)"
+  if ((DRY)); then
+    for d in "${dirs[@]}"; do echo "${B}wp-content/$d${N}"; rsync_down "$d" | grep -v -e '/$' -e '^created directory' | sed 's/^/  /' || true; done
+    return 0
+  fi
+  confirm "Overwrite local files with the live versions?"
+
+  for d in "${dirs[@]}"; do info "Downloading wp-content/$d"; rsync_down "$d" | grep -v -e '^$' -e '^total size' | sed 's/^/  /'; done
+
+  if ((WITH_DB)); then
+    [[ -n $LOCAL_URL ]] || die "LOCAL_URL is empty in config; needed for --db."
+    local ts; ts="$(date +%Y%m%d-%H%M%S)"
+    mkdir -p "$CONFIG_DIR/local-backups"
+    info "Saving local database → .wpship/local-backups/$ts.sql"
+    local_db_export "$CONFIG_DIR_NAME/local-backups/$ts.sql"
+    info "Exporting live database"
+    remote "mkdir -p ~/$(printf %q "$BACKUP_REL")"
+    remote "cd $(printf %q "$REMOTE_PATH") && $REMOTE_WP $WP_ROOT_FLAG db export ~/$(printf %q "$BACKUP_REL")/outgoing.sql --quiet"
+    local tmp="$CONFIG_DIR_NAME/incoming.sql"
+    rsync -az -e "$RSYNC_RSH" "$TARGET:$BACKUP_REL/outgoing.sql" "$SITE_ROOT/$tmp"
+    remote "rm -f ~/$(printf %q "$BACKUP_REL")/outgoing.sql"
+    info "Importing into local site"; local_db_import "$tmp"; rm -f "${SITE_ROOT:?}/$tmp"
+    replace_urls local "$REMOTE_URL" "$LOCAL_URL"
+    warn "Local logins are now the LIVE site's users/passwords."
+  fi
+  ok "Local site updated from $REMOTE_URL"
+}
+
+cmd_rollback() {
+  load_config
+  local id="${ARGS[0]:-}"
+  [[ -n $id ]] || id="$(remote "ls -1d ~/$(printf %q "$BACKUP_REL")/2*/ 2>/dev/null | sort | tail -1 | xargs -r basename")"
+  [[ -n $id ]] || die "No backups found on the server."
+  [[ $id =~ ^[0-9]{8}-[0-9]{6}$ ]] || die "Backup ID looks wrong: $id (see: wpship backups)"
+  remote "test -d ~/$(printf %q "$BACKUP_REL/$id")" || die "Backup $id not found (see: wpship backups)"
+
+  info "Rollback ${B}$REMOTE_URL${N} to backup ${B}$id${N}"
+  echo "  Restores the live database and wp-content to how they were at $id."
+  echo "  Current themes/plugins are moved aside (not deleted) to ~/$BACKUP_REL/replaced-<time>/"
+  ((DRY)) && return 0
+  confirm "Restore backup $id on the LIVE site?"
+
+  remote_script "$REMOTE_PATH" "$BACKUP_REL" "$id" "$REMOTE_WP $WP_ROOT_FLAG" "$(date +%Y%m%d-%H%M%S)" <<'SH'
+set -Eeuo pipefail
+path="$1"; dir="$HOME/$2"; id="$3"; wp="$4"; now="$5"; b="$dir/$id"
+aside="$dir/replaced-$now"; mkdir -p "$aside"
+cd "$path"
+for d in themes plugins mu-plugins; do
+  [ -d "wp-content/$d" ] && mv "wp-content/$d" "$aside/$d"
+done
+if grep -q uploads=1 "$b/meta" 2>/dev/null && [ -d wp-content/uploads ]; then
+  mv wp-content/uploads "$aside/uploads"
+fi
+tar -xzf "$b/wp-content.tar.gz"
+eval "$wp db import \"\$b/db.sql\"" >/dev/null
+echo "  moved previous files to $aside"
+SH
+  post_push_checks && ok "Rolled back to $id"
+}
+
+# ----------------------------------------------------------------- main ----
+main() {
+  local command="${1:-help}"; (($#)) && shift
+  parse_flags "$@"
+  case "$command" in
+    init)          cmd_init ;;
+    check|doctor)  cmd_check ;;
+    install-wpcli) cmd_install_wpcli ;;
+    status|diff)   cmd_status ;;
+    push|deploy)   cmd_push ;;
+    pull)          cmd_pull ;;
+    backup)        cmd_backup ;;
+    backups)       cmd_backups ;;
+    rollback)      cmd_rollback ;;
+    version|-v|--version) echo "wpship $VERSION" ;;
+    help|-h|--help) usage ;;
+    *) die "Unknown command: $command (see: wpship help)" ;;
+  esac
+}
+
+main "$@"

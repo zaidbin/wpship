@@ -1,0 +1,20 @@
+{
+  "name": "wpship",
+  "version": "0.1.0",
+  "description": "Ship a local WordPress site (e.g. WordPress Studio) to any VPS or host over SSH \u2014 with automatic backups, dry runs and one-command rollback.",
+  "author": {
+    "name": "A. Zaid Niazi"
+  },
+  "license": "MIT",
+  "keywords": [
+    "wordpress",
+    "deploy",
+    "ssh",
+    "vps",
+    "rsync",
+    "wp-cli",
+    "studio"
+  ],
+  "homepage": "https://github.com/zaidbin/wpship",
+  "repository": "https://github.com/zaidbin/wpship"
+}
